@@ -31,6 +31,8 @@ ai_client = genai.GenerativeModel(
     system_instruction="あなたは優秀な研究者です"
 )
 
+local_client = OpenAI(base_url="http://172.19.128.1:1234/v1", api_key="lm-studio")
+
 def download_paper(arxiv_url: str, save_dir: str) -> str:
     """
     arXivから論文をダウンロードする関数
@@ -290,7 +292,7 @@ def generate_paper_summary_ochiai_text(pdf_text: str, arxiv_url: str) -> str:
         str: 生成された論文の要約
     """
     token_count = ai_client.count_tokens(pdf_text)
-    pdf_text = pdf_text[:50000]
+    pdf_text = pdf_text[:30000]
     token_count_trunc = ai_client.count_tokens(pdf_text)
     start = datetime.now()
     print(f'generate_paper_summary_ochiai_text {start}')
@@ -330,7 +332,64 @@ f"""論文URL: {arxiv_url}
     print(response)
     return response.text
 
-def paper_reader(arxiv_url: str, processing_mode: str) -> tuple:
+
+def generate_paper_summary_ochiai_text_local(pdf_text: str, arxiv_url: str) -> str:
+    """
+    落合メソッドで論文の要約を生成する関数
+
+    Args:
+        pdf_text (str): 論文から抽出したテキスト
+        arxiv_url (str): 論文のarXivのURL
+
+    Returns:
+        str: 生成された論文の要約
+    """
+    # token_count = ai_client.count_tokens(pdf_text)
+    pdf_text = pdf_text[:1000]
+    # token_count_trunc = ai_client.count_tokens(pdf_text)
+    start = datetime.now()
+    print(f'generate_paper_summary_ochiai_text_local {start}')
+    # print(f'{token_count} -> {token_count_trunc}')
+    response = local_client.chat.completions.create(
+        model="Mistral/mixtral-8x7b-instruct-v0.1",
+        messages=[
+                    {"role": "system", "content": """あなたは優秀な研究者です。提供された論文の画像を元に以下のフォーマットに従って論文の解説を行ってください。
+
+# {論文タイトル}
+
+date: {YYYY-MM-DD}
+categories: {論文のカテゴリ}
+
+## 1. どんなもの？
+## 2. 先行研究と比べてどこがすごいの？
+## 3. 技術や手法の"キモ"はどこにある？
+## 4. どうやって有効だと検証した？
+## 5. 議論はあるか？
+## 6. 次に読むべき論文はあるか？
+## 7. 想定される質問と回答
+## 論文情報・リンク
+- [著者，"タイトル，" ジャーナル名 voluem no.，ページ，年](論文リンク)
+"""
+
+f"論文URL: {arxiv_url}"""},
+                    {"role": "user", "content": f"""論文URL: {arxiv_url}
+以下が論文の内容です
+
+---
+{pdf_text}
+---
+論文の解説はMarkdown形式かつ日本語で記述してください。"""}
+                ],
+        temperature=0.7,
+    )
+    end = datetime.now()
+    print('Time:', end-start)
+    print('ochiai_withtext:')
+    print(response.choices[0].message.content)
+    return response.choices[0].message.content
+
+
+def paper_reader(arxiv_url: str, processing_mode: str, processing_mode_body: str, ) -> tuple:
     """
     論文を読み、要約と説明を生成する関数
 
@@ -345,10 +404,15 @@ def paper_reader(arxiv_url: str, processing_mode: str) -> tuple:
     save_dir_name = os.path.join(tempfile.mkdtemp(), formatted_date)
 
     pdf_path = download_paper(arxiv_url, save_dir_name)
-    pdf_text = extract_text(pdf_path)
-    images = pdf_to_base64(pdf_path)
-    paper_summary_ochiai = generate_paper_summary_ochiai_text(pdf_text, arxiv_url) # テキスト抽出版
-    # paper_summary_ochiai = generate_paper_summary_ochiai(images, arxiv_url) # 画像版
+    if 'body_text' == processing_mode_body:
+        pdf_text = extract_text(pdf_path)
+        paper_summary_ochiai = generate_paper_summary_ochiai_text(pdf_text, arxiv_url) # テキスト抽出版 geminiはテキスト版じゃないと制限引っかかる
+    elif 'body_text_local' == processing_mode_body:
+        pdf_text = extract_text(pdf_path)
+        paper_summary_ochiai = generate_paper_summary_ochiai_text_local(pdf_text, arxiv_url)
+    else:
+        images = pdf_to_base64(pdf_path)
+        paper_summary_ochiai = generate_paper_summary_ochiai(images, arxiv_url) # 画像版
 
     gallery_data = []
     if processing_mode == "none":
@@ -373,13 +437,12 @@ def paper_reader(arxiv_url: str, processing_mode: str) -> tuple:
                 gallery_data.append([data["path"], explanation])
                 explaination_text += f"## 画像{i}\n\n![](data:image/jpg;base64,{data['base64']})\n\n{explanation}\n\n"
 
-    return paper_summary_ochiai, explaination_text, gallery_data
+    return paper_summary_ochiai, explaination_text, gallery_data, pdf_text[:1000]
 
-
-# Gradioインターフェースの設定
-demo = gr.Interface(
-    fn=paper_reader,
-    inputs=[
+# Blocksでappを定義
+with gr.Blocks() as app:
+    title="論文の解説を落合メソッドで生成するアプリ"
+    inputs = [
         gr.Textbox(
             label="論文URL (arXiv)", placeholder="例: https://arxiv.org/abs/2405.16153"
         ),
@@ -392,14 +455,26 @@ demo = gr.Interface(
             label="処理方式",
             value="all",
         ),
-    ],
-    outputs=[
+
+        gr.Radio(
+            choices=[
+                ("本文の解説をテキストでGeminiで行う", "body_text"),
+                ("本文の解説をテキストでローカルLLMで行う", "body_text_local"),
+                ("本文の解説を画像で行う", "body_image"),
+            ],
+            label="本文の処理方式",
+            value="body_text",
+        ),
+    ]
+    btn = gr.Button("クリックしてね!")
+    outputs = [
         gr.Markdown(label="落合メソッドでの解説", show_label=True),
         gr.Markdown(label="数式, 図表の解説", show_label=True),
         gr.Gallery(label="画像説明", show_label=True, elem_id="gallery"),
-    ],
-    title="論文の解説を落合メソッドで生成するアプリ",
-)
+        gr.Markdown(label="落合メソッドでの解説", show_label=True),
+    ]
+    # イベントを定義
+    btn.click(fn=paper_reader, inputs=inputs, outputs=outputs)
 
 if __name__ == "__main__":
-    demo.launch(share=True)
+    app.launch(share=True)
