@@ -1,6 +1,7 @@
 torch
 pillow==9.5.0
 opencv-python
+openai
 google-generativeai
 gradio
 arxiv

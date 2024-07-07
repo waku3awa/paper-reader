@@ -14,7 +14,10 @@ from datetime import datetime
 from pdfminer.high_level import extract_text
 from dotenv import load_dotenv
 import time
+import re
+from llm_utils import get_token_len, get_text_before_word
 
+truncate_len = 30000
 load_dotenv()
 
 # 環境変数からAPIキーを取得
@@ -32,6 +35,7 @@ ai_client = genai.GenerativeModel(
 )
 
 local_client = OpenAI(base_url="http://172.19.128.1:1234/v1", api_key="lm-studio")
+
 
 def download_paper(arxiv_url: str, save_dir: str) -> str:
     """
@@ -291,8 +295,11 @@ def generate_paper_summary_ochiai_text(pdf_text: str, arxiv_url: str) -> str:
     Returns:
         str: 生成された論文の要約
     """
+    # Referencesの前までを取り出す
+    pdf_text = get_text_before_word(pdf_text, 'References')
     token_count = ai_client.count_tokens(pdf_text)
-    pdf_text = pdf_text[:30000]
+    pdf_text = pdf_text[:truncate_len]
+    text_len = get_token_len(pdf_text)
     token_count_trunc = ai_client.count_tokens(pdf_text)
     start = datetime.now()
     print(f'generate_paper_summary_ochiai_text {start}')
@@ -344,9 +351,13 @@ def generate_paper_summary_ochiai_text_local(pdf_text: str, arxiv_url: str) -> s
     Returns:
         str: 生成された論文の要約
     """
-    # token_count = ai_client.count_tokens(pdf_text)
-    pdf_text = pdf_text[:1000]
-    # token_count_trunc = ai_client.count_tokens(pdf_text)
+    # Referencesの前までを取り出す
+    pdf_text = get_text_before_word(pdf_text, 'References')
+    txet_len = get_token_len(pdf_text)
+    print(f'{txet_len = }')
+    pdf_text = pdf_text[:10000]
+    txet_len = get_token_len(pdf_text)
+    print(f'{txet_len = }')
     start = datetime.now()
     print(f'generate_paper_summary_ochiai_text_local {start}')
     # print(f'{token_count} -> {token_count_trunc}')
@@ -389,7 +400,7 @@ f"論文URL: {arxiv_url}"""},
     return response.choices[0].message.content
 
 
-def paper_reader(arxiv_url: str, processing_mode: str, processing_mode_body: str, ) -> tuple:
+def paper_reader(arxiv_url: str, pdf_file, processing_mode: str, processing_mode_body: str, ) -> tuple:
     """
     論文を読み、要約と説明を生成する関数
 
@@ -403,7 +414,17 @@ def paper_reader(arxiv_url: str, processing_mode: str, processing_mode_body: str
     formatted_date = datetime.now().strftime("%Y%m%d_%H%M%S")
     save_dir_name = os.path.join(tempfile.mkdtemp(), formatted_date)
 
-    pdf_path = download_paper(arxiv_url, save_dir_name)
+    if pdf_file:
+        pdf_path = pdf_file
+    else:
+        pdf_path = download_paper(arxiv_url, save_dir_name)
+
+    print(f'Load PDF, {pdf_path = }')
+
+    pdf_name = pdf_path.split('/')[-1].split('.')[0]
+
+    print(f'Processing body start, {processing_mode_body = }')
+
     if 'body_text' == processing_mode_body:
         pdf_text = extract_text(pdf_path)
         paper_summary_ochiai = generate_paper_summary_ochiai_text(pdf_text, arxiv_url) # テキスト抽出版 geminiはテキスト版じゃないと制限引っかかる
@@ -413,11 +434,14 @@ def paper_reader(arxiv_url: str, processing_mode: str, processing_mode_body: str
     else:
         images = pdf_to_base64(pdf_path)
         paper_summary_ochiai = generate_paper_summary_ochiai(images, arxiv_url) # 画像版
+    print(f'Processing body end, {processing_mode_body = }')
 
     gallery_data = []
     if processing_mode == "none":
         explaination_text = ""
     else:
+        print('Processing formulas start')
+
         formula_data = extract_formulas(pdf_path, save_dir_name)
 
         explaination_text = "# 数式の説明\n\n"
@@ -426,7 +450,9 @@ def paper_reader(arxiv_url: str, processing_mode: str, processing_mode_body: str
             explanation = generate_formula_explanation(data["path"], pdf_text)
             gallery_data.append([data["path"], explanation])
             explaination_text += f"## 数式画像{i}\n\n![](data:image/jpg;base64,{data['base64']})\n\n{explanation}\n\n"
+        print('Processing formulas end')
         if processing_mode != "formula_only":
+            print('Processing figures_and_tables start')
             figures_and_tables_data = extract_figures_and_tables(
                 pdf_path, save_dir_name
             )
@@ -436,8 +462,15 @@ def paper_reader(arxiv_url: str, processing_mode: str, processing_mode_body: str
                 explanation = generate_image_explanation(data["path"], pdf_text)
                 gallery_data.append([data["path"], explanation])
                 explaination_text += f"## 画像{i}\n\n![](data:image/jpg;base64,{data['base64']})\n\n{explanation}\n\n"
+            print('Processing figures_and_tables end')
 
-    return paper_summary_ochiai, explaination_text, gallery_data, pdf_text[:1000]
+    with open(f'output/summary_{pdf_name}.md', 'w', encoding='utf-8') as f:
+        f.write(paper_summary_ochiai)
+    if explaination_text:
+        with open(f'output/explaination_{pdf_name}.md', 'w', encoding='utf-8') as f:
+            f.write(explaination_text)
+
+    return pdf_file, paper_summary_ochiai, explaination_text, gallery_data, pdf_text[:truncate_len]
 
 # Blocksでappを定義
 with gr.Blocks() as app:
@@ -445,6 +478,9 @@ with gr.Blocks() as app:
     inputs = [
         gr.Textbox(
             label="論文URL (arXiv)", placeholder="例: https://arxiv.org/abs/2405.16153"
+        ),
+        gr.File(
+            file_count="single", file_types=[".pdf"], height=30, label="PDF(こちらが優先)", type='filepath',
         ),
         gr.Radio(
             choices=[
@@ -468,6 +504,7 @@ with gr.Blocks() as app:
     ]
     btn = gr.Button("クリックしてね!")
     outputs = [
+        gr.Textbox(label="pdf", show_label=True, lines=2, max_lines=2, interactive=False, container=True),
         gr.Markdown(label="落合メソッドでの解説", show_label=True),
         gr.Markdown(label="数式, 図表の解説", show_label=True),
         gr.Gallery(label="画像説明", show_label=True, elem_id="gallery"),
