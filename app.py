@@ -56,7 +56,7 @@ def download_paper(arxiv_url: str, save_dir: str) -> str:
     pdf_path = os.path.join(save_dir, filename)
     paper.download_pdf(dirpath=save_dir, filename=filename)
 
-    return pdf_path
+    return pdf_path, paper.title
 
 
 def extract_figures_and_tables(pdf_path: str, save_dir: str) -> list:
@@ -88,7 +88,7 @@ def extract_figures_and_tables(pdf_path: str, save_dir: str) -> list:
 
         for j, block in enumerate(layout):
             if block.type in ["Table", "Figure"]:
-                segment_image = block.pad(left=5, right=5, top=5, bottom=5).crop_image(
+                segment_image = block.pad(left=5, right=10, top=15, bottom=5).crop_image(
                     image_np
                 )
                 image_path = os.path.join(save_dir, f"page_{i}_block_{j}.jpg")
@@ -191,7 +191,7 @@ def generate_image_explanation(image: str, pdf_text: str) -> str:
     # `upload_file` は非同期的に実行されるため、完了を待たないと次の処理でエラーが発生してしまう
     while sample_file.state.name == "PROCESSING":
       print("Waiting for processed.")
-      time.sleep(10)
+      time.sleep(5)
       sample_file = genai.get_file(sample_file.name)
     response = ai_client.generate_content([
                 f"論文から抽出したテキスト情報は以下です:\n{pdf_text}\n\n提供された論文の画像の示す意味を説明してください。",
@@ -225,13 +225,13 @@ def generate_formula_explanation(image: str, pdf_text: str) -> str:
     # `upload_file` は非同期的に実行されるため、完了を待たないと次の処理でエラーが発生してしまう
     while sample_file.state.name == "PROCESSING":
       print("Waiting for processed.")
-      time.sleep(10)
+      time.sleep(5)
       sample_file = genai.get_file(sample_file.name)
     response = ai_client.generate_content([
                 f"あなたは優秀な研究者です。論文から抽出したテキスト情報は以下です:\n{pdf_text}\n\n提供された論文の数式部分の画像を提供するので、この数式の解説を行ってください",
                 "これは論文から抽出した画像です",
                 sample_file,
-                "数式はmarkdown内で使えるmathjaxを用い$$で囲んでください。解説はMarkdown形式かつ日本語で記述してください。Markdownは```で囲まないでください",
+                "数式はmarkdown内で使え、LaTeX の記法を用いて数式を記述することができるmathjaxを用い$$で囲んでください。解説はMarkdown形式かつ日本語で記述してください。Markdownは```で囲まないでください",
         ])
     genai.delete_file(
         sample_file
@@ -340,6 +340,86 @@ f"""論文URL: {arxiv_url}
     return response.text
 
 
+def generate_paper_summary_ochiai_text_formula(pdf_text: str, images: list, arxiv_url: str) -> str:
+    """
+    落合メソッドで論文の要約を生成する関数
+
+    Args:
+        pdf_text (str): 論文から抽出したテキスト
+        arxiv_url (str): 論文のarXivのURL
+
+    Returns:
+        str: 生成された論文の要約
+    """
+    # Referencesの前までを取り出す
+    pdf_text = get_text_before_word(pdf_text, 'References')
+    token_count = ai_client.count_tokens(pdf_text)
+    pdf_text = pdf_text[:truncate_len]
+    text_len = get_token_len(pdf_text)
+    token_count_trunc = ai_client.count_tokens(pdf_text)
+    start = datetime.now()
+    print(f'generate_paper_summary_ochiai_text {start}')
+    print(f'{token_count} -> {token_count_trunc}')
+
+    # 画像の準備 ---
+    sample_files = []
+    file_names = []
+    for image_data in images:
+        # {"path": image_path, "base64": base64_image, "type": block.type}
+        sample_file = genai.upload_file(path=image_data['path'],
+                           display_name=os.path.basename(image_data['path']))
+    # アップロード完了をチェック
+    # `upload_file` は非同期的に実行されるため、完了を待たないと次の処理でエラーが発生してしまう
+    while sample_file.state.name == "PROCESSING":
+        print("Waiting for processed.")
+        time.sleep(5)
+    sample_files.append(genai.get_file(sample_file.name))
+    file_names.append(sample_file.name)
+    # ---
+
+    response = ai_client.generate_content([
+        """あなたは優秀な研究者です。提供された論文の画像を元に以下のフォーマットに従って論文の解説を行ってください。
+
+# {論文タイトル}
+
+date: {YYYY-MM-DD}
+categories: {論文のカテゴリ}
+
+## 1. どんなもの？
+## 2. 先行研究と比べてどこがすごいの？
+## 3. 技術や手法の"キモ"はどこにある？
+## 4. どうやって有効だと検証した？
+## 5. 議論はあるか？
+## 6. 次に読むべき論文はあるか？
+## 7. 想定される質問と回答
+## 論文情報・リンク
+- [著者，"タイトル，" ジャーナル名 voluem no.，ページ，年](論文リンク)
+## キービジュアル
+{画像名}
+"""
+
+f"論文URL: {arxiv_url}",
+
+f"""論文URL: {arxiv_url}
+以下が論文の内容です。
+
+---
+{pdf_text}
+---
+以下は論文から抽出した図、表、数式の画像です。必要であれば画像の情報を使って解説をしてください。また、この論文のキービジュアルを1枚選択し画像名を記入してください。""",
+*[f'画像名: {name}, 画像: {file}' for file, name in zip(sample_files, file_names)],
+"""数式はmarkdown内で使え、LaTeX の記法を用いて数式を記述することができるmathjaxを用い$$で囲んでください。解説はMarkdown形式かつ日本語で記述してください。Markdownは```で囲まないでください"
+
+論文の解説はMarkdown形式かつ日本語で記述してください。""",
+        ])
+    end = datetime.now()
+    print('Time:', end-start)
+    genai.delete_file(sample_file)
+    print('ochiai_withtext:')
+    print(response)
+    return response.text
+
+
 def generate_paper_summary_ochiai_text_local(pdf_text: str, arxiv_url: str) -> str:
     """
     落合メソッドで論文の要約を生成する関数
@@ -416,34 +496,46 @@ def paper_reader(arxiv_url: str, pdf_file, processing_mode: str, processing_mode
 
     if pdf_file:
         pdf_path = pdf_file
+        pdf_name = pdf_path.split('/')[-1].split('.')[0]
     else:
-        pdf_path = download_paper(arxiv_url, save_dir_name)
+        pdf_path, pdf_name = download_paper(arxiv_url, save_dir_name)
 
     print(f'Load PDF, {pdf_path = }')
 
-    pdf_name = pdf_path.split('/')[-1].split('.')[0]
+    if processing_mode == "all" or processing_mode == "text_formula":
+        print('Extract images start')
+        formula_data = extract_formulas(pdf_path, save_dir_name)
+    else:
+        formula_data = []
+    # 図表は解説対象になくても添えるため抽出する
+    figures_and_tables_data = extract_figures_and_tables(pdf_path, save_dir_name)
 
     print(f'Processing body start, {processing_mode_body = }')
 
-    if 'body_text' == processing_mode_body:
+    processing_body, llm_client = processing_mode_body.split('-')
+
+    if 'body_text' == processing_body:
         pdf_text = extract_text(pdf_path)
-        paper_summary_ochiai = generate_paper_summary_ochiai_text(pdf_text, arxiv_url) # テキスト抽出版 geminiはテキスト版じゃないと制限引っかかる
-    elif 'body_text_local' == processing_mode_body:
-        pdf_text = extract_text(pdf_path)
-        paper_summary_ochiai = generate_paper_summary_ochiai_text_local(pdf_text, arxiv_url)
-    else:
+    elif 'body_image' == processing_body:
         images = pdf_to_base64(pdf_path)
+    else:
+        pass
+
+    if 'gemini' == llm_client and 'body_text' == processing_body:
+        # テキスト抽出版 geminiはテキスト版じゃないと制限引っかかる
+        paper_summary_ochiai = generate_paper_summary_ochiai_text_formula(pdf_text, figures_and_tables_data + formula_data, arxiv_url)
+        # paper_summary_ochiai = generate_paper_summary_ochiai_text(pdf_text, arxiv_url)
+    elif 'gemini' == llm_client and 'body_image' == processing_body:
         paper_summary_ochiai = generate_paper_summary_ochiai(images, arxiv_url) # 画像版
+    else:
+        paper_summary_ochiai = generate_paper_summary_ochiai_text_local(pdf_text, arxiv_url)
     print(f'Processing body end, {processing_mode_body = }')
 
     gallery_data = []
-    if processing_mode == "none":
+    if processing_mode == "text_only":
         explaination_text = ""
     else:
         print('Processing formulas start')
-
-        formula_data = extract_formulas(pdf_path, save_dir_name)
-
         explaination_text = "# 数式の説明\n\n"
         for i, data in enumerate(formula_data):
             # explanation = generate_formula_explanation(data["base64"], pdf_text)
@@ -453,9 +545,6 @@ def paper_reader(arxiv_url: str, pdf_file, processing_mode: str, processing_mode
         print('Processing formulas end')
         if processing_mode != "formula_only":
             print('Processing figures_and_tables start')
-            figures_and_tables_data = extract_figures_and_tables(
-                pdf_path, save_dir_name
-            )
             explaination_text += "# 図表の説明\n\n"
             for i, data in enumerate(figures_and_tables_data):
                 # explanation = generate_image_explanation(data["base64"], pdf_text)
@@ -472,6 +561,7 @@ def paper_reader(arxiv_url: str, pdf_file, processing_mode: str, processing_mode
 
     return pdf_file, paper_summary_ochiai, explaination_text, gallery_data, pdf_text[:truncate_len]
 
+
 # Blocksでappを定義
 with gr.Blocks() as app:
     title="論文の解説を落合メソッドで生成するアプリ"
@@ -484,9 +574,9 @@ with gr.Blocks() as app:
         ),
         gr.Radio(
             choices=[
-                ("数式, 図表の解説を行う", "all"),
-                ("数式の解説のみ行う", "formula_only"),
-                ("数式, 図表の解説を行わない", "none"),
+                ("テキスト、数式、図表の解説を行う", "all"),
+                ("テキスト、数式の解説を行う", "text_formula"),
+                ("テキストの解説のみ行う", "text_only"),
             ],
             label="処理方式",
             value="all",
@@ -494,12 +584,12 @@ with gr.Blocks() as app:
 
         gr.Radio(
             choices=[
-                ("本文の解説をテキストでGeminiで行う", "body_text"),
-                ("本文の解説をテキストでローカルLLMで行う", "body_text_local"),
-                ("本文の解説を画像で行う", "body_image"),
+                ("本文の解説をテキストでGeminiで行う", "body_text-gemini"),
+                ("本文の解説をテキストでローカルLLMで行う", "body_text-local"),
+                ("本文の解説を画像でGeminiで行う", "body_image-gemini"),
             ],
             label="本文の処理方式",
-            value="body_text",
+            value="body_text-gemini",
         ),
     ]
     btn = gr.Button("クリックしてね!")
